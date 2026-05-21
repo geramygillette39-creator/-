@@ -32,38 +32,32 @@ st.markdown("""
 # 2. 数据加载与超级清洗
 # ==========================================
 def clean_option_text(text, prefix):
-    """如果选项内容开头已经包含了 'A.' 'A、' 等，自动将其剔除，防止前端重复显示"""
     text = str(text).strip()
-    # 匹配以 A. A、 A  或 小写 a. a、 等开头的文本
     pattern = rf'^{prefix}\s*[\.\、\s]?\s*'
     return re.sub(pattern, '', text, flags=re.IGNORECASE)
 
+@st.cache_data
 def load_data(filename="questions.xlsx"):
     try:
         df = pd.read_excel(filename, dtype=str)
         df.columns = df.columns.str.strip()
         df.rename(columns={'选项a': '选项A', '选项b': '选项B', '选项c': '选项C', '选项d': '选项D'}, inplace=True)
         
-        # 清洗掉可能由于WPS留下的多余空行
         df.dropna(subset=['题干', '正确答案'], inplace=True)
         df = df.reset_index(drop=True)
         df['ID'] = df.index
         
-        # 【核心清洗逻辑】
         for idx, row in df.iterrows():
-            # 1. 选项去重清洗：把 "A.①②" 变成 "①②"
             df.at[idx, '选项A'] = clean_option_text(row['选项A'], 'A')
             df.at[idx, '选项B'] = clean_option_text(row['选项B'], 'B')
             df.at[idx, '选项C'] = clean_option_text(row['选项C'], 'C')
             df.at[idx, '选项D'] = clean_option_text(row['选项D'], 'D')
             
-            # 2. 提取正确答案的首字母：不管Excel里写 "C.②④" 还是 "C"，统统只拿 "C"
             ans_str = str(row['正确答案']).strip().upper()
             match = re.match(r'([A-D])', ans_str)
             if match:
                 df.at[idx, '正确答案_干净'] = match.group(1)
             else:
-                # 备用容错：如果实在没匹配到，全角转半角提取
                 full_to_half = {"Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D"}
                 first_char = ans_str[0] if len(ans_str) > 0 else 'A'
                 df.at[idx, '正确答案_干净'] = full_to_half.get(first_char, first_char)
@@ -91,12 +85,24 @@ def init_session():
         st.session_state.is_correct = None
     if 'selected_option' not in st.session_state:
         st.session_state.selected_option = None
+    # 记录上一次选择的章节和模式，用于监听切换
+    if 'last_chapter' not in st.session_state:
+        st.session_state.last_chapter = None
+    if 'last_mode' not in st.session_state:
+        st.session_state.last_mode = None
 
 init_session()
 
 # ==========================================
 # 4. 核心逻辑函数
 # ==========================================
+def reset_question_state():
+    """彻底重置题目相关的状态，用于切换章节时"""
+    st.session_state.current_q_id = None
+    st.session_state.answered = False
+    st.session_state.selected_option = None
+    st.session_state.is_correct = None
+
 def get_next_question(mode, chapter=None):
     st.session_state.answered = False
     st.session_state.selected_option = None
@@ -117,7 +123,6 @@ def submit_answer(q_id, user_ans, correct_ans_clean, chapter):
     st.session_state.answered = True
     st.session_state.selected_option = user_ans
     
-    # 此时进行纯净的单字母对齐比对
     if user_ans == correct_ans_clean:
         st.session_state.is_correct = True
         if chapter in st.session_state.progress:
@@ -141,11 +146,23 @@ with st.sidebar:
     st.header("⚙️ 刷题设置")
     mode = st.radio("选择模式", ["章节练习", "错题本模式"])
     
+    # 监听模式切换
+    if mode != st.session_state.last_mode:
+        st.session_state.last_mode = mode
+        reset_question_state()
+        st.rerun()
+    
     chapter_selected = None
     valid_chapters = [ch for ch in df['章节'].unique() if pd.notna(ch)]
     
     if mode == "章节练习":
         chapter_selected = st.selectbox("选择章节", valid_chapters)
+        
+        # 【关键监听核心】如果发现当前选中的章节和上一次记录的不一样，说明用户切章节了
+        if chapter_selected != st.session_state.last_chapter:
+            st.session_state.last_chapter = chapter_selected  # 更新记录
+            reset_question_state()                           # 清空老题目状态
+            st.rerun()                                       # 强制页面重绘，加载新章节题目
         
         total_q = len(df[df['章节'] == chapter_selected])
         mastered_q = len(st.session_state.progress.get(chapter_selected, set()))
@@ -164,9 +181,11 @@ with st.sidebar:
     else:
         st.success("✨ 暂无错题，继续保持！")
 
+# 如果状态被清空了，在这里立刻抽一道新章节的题
 if st.session_state.current_q_id is None:
     get_next_question(mode, chapter_selected)
 
+# 确保题目ID在当前题库中真实存在
 if st.session_state.current_q_id is not None and st.session_state.current_q_id in df['ID'].values:
     q_data = df[df['ID'] == st.session_state.current_q_id].iloc[0]
     q_id = q_data['ID']
@@ -174,7 +193,6 @@ if st.session_state.current_q_id is not None and st.session_state.current_q_id i
     question = q_data['题干']
     options = {'A': q_data['选项A'], 'B': q_data['选项B'], 'C': q_data['选项C'], 'D': q_data['选项D']}
     
-    # 核心数据传递
     correct_ans_raw = str(q_data['正确答案']).strip()
     correct_ans_clean = q_data['正确答案_干净']
     explanation = q_data['解析']
@@ -205,7 +223,6 @@ if st.session_state.current_q_id is not None and st.session_state.current_q_id i
             st.success("🎉 太棒了！回答正确！继续保持！")
             st.balloons()
         else:
-            # 优雅展示：如果原答案写得太长，就直接把原答案展示出来更直观
             st.error(f"❌ 回答错误。正确答案是：**{correct_ans_raw}**")
             with st.expander("📝 查看解析", expanded=True):
                 st.write(explanation)
