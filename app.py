@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import random
+import re
 
 # ==========================================
 # 1. 页面基本配置与强制浅色主题
@@ -28,11 +29,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 数据加载
+# 2. 数据加载与超级清洗
 # ==========================================
+def clean_option_text(text, prefix):
+    """如果选项内容开头已经包含了 'A.' 'A、' 等，自动将其剔除，防止前端重复显示"""
+    text = str(text).strip()
+    # 匹配以 A. A、 A  或 小写 a. a、 等开头的文本
+    pattern = rf'^{prefix}\s*[\.\、\s]?\s*'
+    return re.sub(pattern, '', text, flags=re.IGNORECASE)
+
 def load_data(filename="questions.xlsx"):
     try:
-        # 读取全量题目
         df = pd.read_excel(filename, dtype=str)
         df.columns = df.columns.str.strip()
         df.rename(columns={'选项a': '选项A', '选项b': '选项B', '选项c': '选项C', '选项d': '选项D'}, inplace=True)
@@ -42,6 +49,25 @@ def load_data(filename="questions.xlsx"):
         df = df.reset_index(drop=True)
         df['ID'] = df.index
         
+        # 【核心清洗逻辑】
+        for idx, row in df.iterrows():
+            # 1. 选项去重清洗：把 "A.①②" 变成 "①②"
+            df.at[idx, '选项A'] = clean_option_text(row['选项A'], 'A')
+            df.at[idx, '选项B'] = clean_option_text(row['选项B'], 'B')
+            df.at[idx, '选项C'] = clean_option_text(row['选项C'], 'C')
+            df.at[idx, '选项D'] = clean_option_text(row['选项D'], 'D')
+            
+            # 2. 提取正确答案的首字母：不管Excel里写 "C.②④" 还是 "C"，统统只拿 "C"
+            ans_str = str(row['正确答案']).strip().upper()
+            match = re.match(r'([A-D])', ans_str)
+            if match:
+                df.at[idx, '正确答案_干净'] = match.group(1)
+            else:
+                # 备用容错：如果实在没匹配到，全角转半角提取
+                full_to_half = {"Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D"}
+                first_char = ans_str[0] if len(ans_str) > 0 else 'A'
+                df.at[idx, '正确答案_干净'] = full_to_half.get(first_char, first_char)
+                
         return df
     except FileNotFoundError:
         st.error(f"找不到题库文件 `{filename}`！请确保文件存在且和代码在同一目录下。")
@@ -87,23 +113,12 @@ def get_next_question(mode, chapter=None):
             return
         st.session_state.current_q_id = random.choice(list(st.session_state.mistakes.keys()))
 
-def submit_answer(q_id, user_ans, correct_ans, chapter):
+def submit_answer(q_id, user_ans, correct_ans_clean, chapter):
     st.session_state.answered = True
     st.session_state.selected_option = user_ans
     
-    # 【核心修复】
-    # 1. 统一转换为大写
-    # 2. 去除两端看不见的空格
-    # 3. 自动将中文全角“ＡＢＣＤ”转换为英文半角“ABCD”
-    clean_user = str(user_ans).strip().upper()
-    clean_correct = str(correct_ans).strip().upper()
-    
-    # 建立全角到半角的映射表，防止Excel里不小心输入了中文全角字母
-    full_to_half = {"Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D"}
-    clean_correct = full_to_half.get(clean_correct, clean_correct)
-    
-    # 重新比对
-    if clean_user == clean_correct:
+    # 此时进行纯净的单字母对齐比对
+    if user_ans == correct_ans_clean:
         st.session_state.is_correct = True
         if chapter in st.session_state.progress:
             st.session_state.progress[chapter].add(q_id)
@@ -132,14 +147,12 @@ with st.sidebar:
     if mode == "章节练习":
         chapter_selected = st.selectbox("选择章节", valid_chapters)
         
-        # 计算进度比例，但不展示具体的数字
         total_q = len(df[df['章节'] == chapter_selected])
         mastered_q = len(st.session_state.progress.get(chapter_selected, set()))
         progress_pct = int((mastered_q / total_q) * 100) if total_q > 0 else 0
         
         st.markdown("---")
         st.subheader("📊 章节学习进度")
-        # 仅显示进度条，隐藏“XX / XX题”数字
         st.progress(progress_pct)
         st.caption(f"当前章节已掌握：{progress_pct}%")
         
@@ -154,14 +167,16 @@ with st.sidebar:
 if st.session_state.current_q_id is None:
     get_next_question(mode, chapter_selected)
 
-# 确保题目ID在当前题库中真实存在
 if st.session_state.current_q_id is not None and st.session_state.current_q_id in df['ID'].values:
     q_data = df[df['ID'] == st.session_state.current_q_id].iloc[0]
     q_id = q_data['ID']
     chapter = q_data['章节']
     question = q_data['题干']
     options = {'A': q_data['选项A'], 'B': q_data['选项B'], 'C': q_data['选项C'], 'D': q_data['选项D']}
-    correct_ans = str(q_data['正确答案']).strip().upper()
+    
+    # 核心数据传递
+    correct_ans_raw = str(q_data['正确答案']).strip()
+    correct_ans_clean = q_data['正确答案_干净']
     explanation = q_data['解析']
     
     st.caption(f"📍 章节：{chapter} {' | ⚠️ 错题复习' if mode == '错题本模式' else ''}")
@@ -174,7 +189,7 @@ if st.session_state.current_q_id is not None and st.session_state.current_q_id i
         if st.button("提交答案", type="primary"):
             if user_choice:
                 user_letter = user_choice.split(".")[0]
-                submit_answer(q_id, user_letter, correct_ans, chapter)
+                submit_answer(q_id, user_letter, correct_ans_clean, chapter)
                 st.rerun()
             else:
                 st.warning("请先选择一个答案！")
@@ -190,7 +205,8 @@ if st.session_state.current_q_id is not None and st.session_state.current_q_id i
             st.success("🎉 太棒了！回答正确！继续保持！")
             st.balloons()
         else:
-            st.error(f"❌ 回答错误。正确答案是：**{correct_ans}**")
+            # 优雅展示：如果原答案写得太长，就直接把原答案展示出来更直观
+            st.error(f"❌ 回答错误。正确答案是：**{correct_ans_raw}**")
             with st.expander("📝 查看解析", expanded=True):
                 st.write(explanation)
                 
