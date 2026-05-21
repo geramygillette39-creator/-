@@ -91,7 +91,19 @@ def submit_answer(q_id, user_ans, correct_ans, chapter):
     st.session_state.answered = True
     st.session_state.selected_option = user_ans
     
-    if user_ans == correct_ans:
+    # 【核心修复】
+    # 1. 统一转换为大写
+    # 2. 去除两端看不见的空格
+    # 3. 自动将中文全角“ＡＢＣＤ”转换为英文半角“ABCD”
+    clean_user = str(user_ans).strip().upper()
+    clean_correct = str(correct_ans).strip().upper()
+    
+    # 建立全角到半角的映射表，防止Excel里不小心输入了中文全角字母
+    full_to_half = {"Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D"}
+    clean_correct = full_to_half.get(clean_correct, clean_correct)
+    
+    # 重新比对
+    if clean_user == clean_correct:
         st.session_state.is_correct = True
         if chapter in st.session_state.progress:
             st.session_state.progress[chapter].add(q_id)
