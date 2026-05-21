@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import random
 import re
+import json
+import os
 
 # ==========================================
 # 1. 页面基本配置与强制浅色主题
@@ -12,21 +14,16 @@ st.set_page_config(
     layout="centered"
 )
 
-# 强制锁死浅色模式（白底黑字）
 st.markdown("""
     <style>
-    .stApp {
-        background-color: #FFFFFF !important;
-        color: #31333F !important;
-    }
-    h1, h2, h3, p, span, label {
-        color: #31333F !important;
-    }
-    div[data-testid="stMarkdownContainer"] p {
-        color: #31333F !important;
-    }
+    .stApp { background-color: #FFFFFF !important; color: #31333F !important; }
+    h1, h2, h3, p, span, label { color: #31333F !important; }
+    div[data-testid="stMarkdownContainer"] p { color: #31333F !important; }
     </style>
 """, unsafe_allow_html=True)
+
+# 定义本地保存状态的文件名
+SAVE_FILE = "user_progress_data.json"
 
 # ==========================================
 # 2. 数据加载与超级清洗
@@ -70,13 +67,60 @@ def load_data(filename="questions.xlsx"):
 df = load_data()
 
 # ==========================================
-# 3. 初始化 Session 状态
+# 3. 本地存储核心读写逻辑（新增强化）
+# ==========================================
+def load_local_data():
+    """从本地 JSON 文件中加载错题本和进度"""
+    # 默认空结构
+    default_data = {"mistakes": {}, "progress": {}}
+    
+    if os.path.exists(SAVE_FILE):
+        try:
+            with open(SAVE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # JSON 的 key 默认是字符串，我们需要把错题本的 key (题目ID) 转回 int
+                if "mistakes" in data:
+                    data["mistakes"] = {int(k): v for k, v in data["mistakes"].items()}
+                # 把进度里的题目ID列表转回 Python 的 set 集合
+                if "progress" in data:
+                    data["progress"] = {k: set(int(i) for i in v) for k, v in data["progress"].items()}
+                return data
+        except Exception:
+            # 如果读取损坏，防崩溃返回默认值
+            return default_data
+    return default_data
+
+def save_local_data():
+    """将当前的错题本和进度保存到本地 JSON 文件"""
+    # 将 set 转换为 list，因为 JSON 不支持直接存 set
+    serializable_progress = {k: list(v) for k, v in st.session_state.progress.items()}
+    
+    save_data = {
+        "mistakes": st.session_state.mistakes,
+        "progress": serializable_progress
+    }
+    
+    with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(save_data, f, ensure_ascii=False, indent=4)
+
+# ==========================================
+# 4. 初始化 Session 状态
 # ==========================================
 def init_session():
+    # 先尝试从本地硬盘读取之前保存的历史记录
+    local_history = load_local_data()
+    
     if 'mistakes' not in st.session_state:
-        st.session_state.mistakes = {}
+        st.session_state.mistakes = local_history.get("mistakes", {})
+        
     if 'progress' not in st.session_state:
-        st.session_state.progress = {chapter: set() for chapter in df['章节'].unique() if pd.notna(chapter)}
+        # 如果本地有进度就用本地的，没有就针对所有章节初始化空的 set
+        saved_progress = local_history.get("progress", {})
+        st.session_state.progress = {
+            chapter: saved_progress.get(chapter, set()) 
+            for chapter in df['章节'].unique() if pd.notna(chapter)
+        }
+        
     if 'current_q_id' not in st.session_state:
         st.session_state.current_q_id = None
     if 'answered' not in st.session_state:
@@ -85,7 +129,6 @@ def init_session():
         st.session_state.is_correct = None
     if 'selected_option' not in st.session_state:
         st.session_state.selected_option = None
-    # 记录上一次选择的章节和模式，用于监听切换
     if 'last_chapter' not in st.session_state:
         st.session_state.last_chapter = None
     if 'last_mode' not in st.session_state:
@@ -94,10 +137,9 @@ def init_session():
 init_session()
 
 # ==========================================
-# 4. 核心逻辑函数
+# 5. 核心逻辑函数
 # ==========================================
 def reset_question_state():
-    """彻底重置题目相关的状态，用于切换章节时"""
     st.session_state.current_q_id = None
     st.session_state.answered = False
     st.session_state.selected_option = None
@@ -136,9 +178,12 @@ def submit_answer(q_id, user_ans, correct_ans_clean, chapter):
     else:
         st.session_state.is_correct = False
         st.session_state.mistakes[q_id] = 0
+        
+    # 【核心改动】只要用户提交了答案（无论对错），立刻静默同步保存到本地硬盘
+    save_local_data()
 
 # ==========================================
-# 5. UI界面渲染
+# 6. UI界面渲染
 # ==========================================
 st.title("📚 初中道法智能刷题系统")
 
@@ -146,7 +191,6 @@ with st.sidebar:
     st.header("⚙️ 刷题设置")
     mode = st.radio("选择模式", ["章节练习", "错题本模式"])
     
-    # 监听模式切换
     if mode != st.session_state.last_mode:
         st.session_state.last_mode = mode
         reset_question_state()
@@ -158,11 +202,10 @@ with st.sidebar:
     if mode == "章节练习":
         chapter_selected = st.selectbox("选择章节", valid_chapters)
         
-        # 【关键监听核心】如果发现当前选中的章节和上一次记录的不一样，说明用户切章节了
         if chapter_selected != st.session_state.last_chapter:
-            st.session_state.last_chapter = chapter_selected  # 更新记录
-            reset_question_state()                           # 清空老题目状态
-            st.rerun()                                       # 强制页面重绘，加载新章节题目
+            st.session_state.last_chapter = chapter_selected
+            reset_question_state()
+            st.rerun()
         
         total_q = len(df[df['章节'] == chapter_selected])
         mastered_q = len(st.session_state.progress.get(chapter_selected, set()))
@@ -180,12 +223,19 @@ with st.sidebar:
         st.caption("提示：在错题本中累计答对3次即可自动消灭错题。")
     else:
         st.success("✨ 暂无错题，继续保持！")
+        
+    # 在侧边栏最下方加一个贴心的小按钮，允许清空所有缓存重新开始
+    st.markdown("---")
+    if st.button("🔄 清空历史，重新开始"):
+        if os.path.exists(SAVE_FILE):
+            os.remove(SAVE_FILE)
+        st.session_state.clear()
+        st.toast("历史记录已全部清空！")
+        st.rerun()
 
-# 如果状态被清空了，在这里立刻抽一道新章节的题
 if st.session_state.current_q_id is None:
     get_next_question(mode, chapter_selected)
 
-# 确保题目ID在当前题库中真实存在
 if st.session_state.current_q_id is not None and st.session_state.current_q_id in df['ID'].values:
     q_data = df[df['ID'] == st.session_state.current_q_id].iloc[0]
     q_id = q_data['ID']
